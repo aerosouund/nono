@@ -2142,6 +2142,7 @@ fn wait_for_child_with_pty(
         }
         let in_band_detach_requested = pty.take_detach_request();
         handle_pty_detach_request(Some(pty), pause_requested, in_band_detach_requested);
+        handle_pty_signal_relay(Some(pty));
         handle_pty_suspension(Some(pty), child);
 
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
@@ -2276,6 +2277,25 @@ static PTY_MASTER_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI3
 static PAUSE_PIPE_WRITE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 static PAUSE_PIPE_READ: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
+/// Serializes reads of `PTY_MASTER_FD` against the teardown.
+static PTY_MASTER_FD_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The current foreground process group of the pty nono created for its own
+/// direct child.
+#[cfg(target_os = "macos")]
+pub(crate) fn pty_foreground_pgid() -> Option<Pid> {
+    let _guard = PTY_MASTER_FD_GUARD.lock().ok()?;
+    let fd = PTY_MASTER_FD.load(std::sync::atomic::Ordering::SeqCst);
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: borrowed only for this call, and the fd is still open for its
+    // duration. `SignalForwardingGuard` is declared after the `PtyProxy` local,
+    // so it drops first.
+    let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+    nix::unistd::tcgetpgrp(fd).ok()
+}
+
 fn create_pause_pipe() -> i32 {
     let mut fds = [0i32; 2];
     let ret = unsafe { libc::pipe(fds.as_mut_ptr()) };
@@ -2335,6 +2355,13 @@ extern "C" fn forward_signal(sig: libc::c_int) {
                 }
             }
         } else {
+            let relay_fd = crate::tool_sandbox::signal_relay_write_fd();
+            if relay_fd >= 0 {
+                let byte = [sig as u8];
+                unsafe {
+                    libc::write(relay_fd, byte.as_ptr().cast(), 1);
+                }
+            }
             unsafe {
                 libc::kill(child_raw, sig);
             }
@@ -2358,7 +2385,16 @@ extern "C" fn forward_signal(sig: libc::c_int) {
 
 fn clear_signal_forwarding_target() {
     CHILD_PID.store(0, std::sync::atomic::Ordering::SeqCst);
-    PTY_MASTER_FD.store(-1, std::sync::atomic::Ordering::SeqCst);
+    // Before the pty fd is dropped below: a relayed signal still in the pipe is
+    // delivered from the relay thread, which resolves its target through
+    // `pty_foreground_pgid`.
+    crate::tool_sandbox::stop_signal_relay();
+    {
+        // Held so a relay-thread `pty_foreground_pgid` cannot be mid-`tcgetpgrp`
+        // on the fd the owning `PtyProxy` is about to close.
+        let _guard = PTY_MASTER_FD_GUARD.lock();
+        PTY_MASTER_FD.store(-1, std::sync::atomic::Ordering::SeqCst);
+    }
     close_pause_pipe();
 }
 
@@ -2437,6 +2473,20 @@ fn signal_pty_foreground_group(pty: &crate::pty_proxy::PtyProxy, child: Pid, sig
     }
 }
 
+/// Relay a Ctrl-C or Ctrl-\ intercepted by the PtyProxy to mediated
+/// tool-sandbox children.
+fn handle_pty_signal_relay(pty: Option<&mut crate::pty_proxy::PtyProxy>) {
+    let Some(pty) = pty else {
+        return;
+    };
+    if let Some(pgid) = pty.take_interrupt_request() {
+        crate::tool_sandbox::signal_active_children_in_pgroup(pgid, Signal::SIGINT);
+    }
+    if let Some(pgid) = pty.take_quit_request() {
+        crate::tool_sandbox::signal_active_children_in_pgroup(pgid, Signal::SIGQUIT);
+    }
+}
+
 /// Handle a Ctrl-Z suspension request intercepted by the PtyProxy.
 ///
 /// The handling depends on whether the PTY foreground group is nono's direct
@@ -2462,10 +2512,9 @@ fn handle_pty_suspension(pty: Option<&mut crate::pty_proxy::PtyProxy>, child: Pi
         Some(pgid) => pgid.as_raw() == child.as_raw(),
         None => true,
     };
-
     // Nested job: forward SIGTSTP and let the inner shell handle it. Do not
     // waitpid() — the stopped job is not our child, and the inner shell is
-    // already blocked waiting on it, so waiting here would hang.
+    // already blocked waiting on it, so waiting here would hang..
     if !child_is_foreground {
         if let Some(pgid) = fg_pgid {
             let _ = signal::kill(Pid::from_raw(-pgid.as_raw()), Signal::SIGTSTP);
@@ -2476,6 +2525,7 @@ fn handle_pty_suspension(pty: Option<&mut crate::pty_proxy::PtyProxy>, child: Pi
     // Direct child (orphaned PG): SIGSTOP is uncatchable, unlike SIGTSTP which
     // an interactive bash ignores, so it forces the stopped state immediately.
     signal_pty_foreground_group(pty, child, Signal::SIGSTOP);
+    let stopped_mediated = crate::tool_sandbox::stop_active_children_in_pgroup(child);
 
     loop {
         match waitpid(child, Some(WaitPidFlag::WUNTRACED)) {
@@ -2484,10 +2534,14 @@ fn handle_pty_suspension(pty: Option<&mut crate::pty_proxy::PtyProxy>, child: Pi
                 break;
             }
             Ok(WaitStatus::Exited(..) | WaitStatus::Signaled(..)) => {
+                crate::tool_sandbox::resume_mediated_children(&stopped_mediated);
                 return;
             }
             Err(nix::errno::Errno::EINTR) => continue,
-            Err(_) => return,
+            Err(_) => {
+                crate::tool_sandbox::resume_mediated_children(&stopped_mediated);
+                return;
+            }
             _ => {}
         }
     }
@@ -2526,6 +2580,7 @@ fn handle_pty_suspension(pty: Option<&mut crate::pty_proxy::PtyProxy>, child: Pi
     pty.reenter_screen_for_resume();
 
     signal_pty_foreground_group(pty, child, Signal::SIGCONT);
+    crate::tool_sandbox::resume_mediated_children(&stopped_mediated);
 
     // SIGSTOP doesn't give the child a chance to clean up its terminal state.
     // When resumed, TUI apps (opencode, vim, htop) don't know they need to
@@ -2748,6 +2803,7 @@ fn run_supervisor_loop(
             pause_requested,
             in_band_detach_requested,
         );
+        handle_pty_signal_relay(pty.as_deref_mut());
         handle_pty_suspension(pty.as_deref_mut(), child);
 
         match waitpid(child, Some(WaitPidFlag::WNOHANG)) {
@@ -3138,6 +3194,7 @@ fn run_supervisor_loop(
             pause_requested,
             in_band_detach_requested,
         );
+        handle_pty_signal_relay(pty.as_deref_mut());
         handle_pty_suspension(pty.as_deref_mut(), child);
 
         // Drain reparented orphans; if the primary child was among them,
